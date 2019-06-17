@@ -95,6 +95,10 @@ typedef struct {
 
   unsigned beam;
 
+  uint64_t event_arrival;
+  uint64_t event_arrival_frac_numer;
+  uint64_t event_arrival_frac_denom;
+
 } event_t;
 
 #define DADA_DBEVENT_INIT { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
@@ -604,6 +608,8 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
   char * event_start_fractional;
   char * event_end;
   char * event_end_fractional;
+  char * event_arrival;
+  char * event_arrival_fractional;
   char * event_snr_str;
   char * event_dm_str;
   char * event_width_str;
@@ -732,7 +738,8 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
     event_end_fractional = strtok_r (NULL, sep_time, &saveptr);
 
     if (dbevent->verbose)
-      multilog (log, LOG_INFO, "event_end=%s event_end_fractional=%s\n", event_start, event_start_fractional);
+      multilog (log, LOG_INFO, "event_end=%s event_end_fractional=%s\n", event_end, event_end_fractional);
+
     offset = calculate_byte_offset (dbevent, event_end, event_end_fractional);
     if (offset >= 0)
     {
@@ -743,6 +750,23 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
     }
     else
       events[i].end_byte = 0;
+
+    // extract ARRIVAL_UTC string excluding sub-second components
+    event_arrival = strtok_r (NULL, sep_time, &saveptr);
+    if (event_arrival == NULL)
+    {
+      multilog (log, LOG_WARNING, "receive_events: problem extracting event_arrival\n");
+      more_events = 0;
+      continue;
+    }
+    event_arrival_fractional = strtok_r (NULL, sep_time, &saveptr);
+
+    if (dbevent->verbose)
+      multilog (log, LOG_INFO, "event_arrival=%s event_arrival_fractional=%s\n", event_arrival, event_arrival_fractional);
+
+    events[i].event_arrival = str2utctime (event_arrival);
+    sscanf (event_arrival_fractional, "%"PRIu64, &events[i].event_arrival_frac_numer);
+    events[i].event_arrival_frac_denom = (uint64_t) powf(10,strlen(event_arrival_fractional));
 
     event_dm_str = strtok_r (NULL, sep_float, &saveptr);
     sscanf(event_dm_str, "%f", &(events[i].dm));
@@ -878,6 +902,9 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
         ascii_header_set (header, "EVENT_DM", "%f",  events[i].dm);
         ascii_header_set (header, "EVENT_WIDTH", "%f",  events[i].width);
         ascii_header_set (header, "EVENT_BEAM", "%u",  events[i].beam);
+        ascii_header_set (header, "EVENT_ARRIVAL", "%"PRIu64, events[i].event_arrival); // cast to know type
+        ascii_header_set (header, "EVENT_ARRIVAL_NUMER", "%"PRIu64,  events[i].event_arrival_frac_numer);
+        ascii_header_set (header, "EVENT_ARRIVAL_DENOM", "%"PRIu64,  events[i].event_arrival_frac_denom);
 
         // tag this header as filled
         ipcbuf_mark_filled (dbevent->out_hdu->header_block, header_size);
