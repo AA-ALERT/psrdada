@@ -822,12 +822,14 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
       // for each event, check that its in the future, and if so, seek forward to it
       uint64_t current_byte = 0;
       int64_t seeked_byte = 0;
+      int events_skipped = 0;
       for (i=0; i<n_events; i++)
       {
         if ((events[i].start_byte == 0) && (events[i].end_byte == 0))
         {
           if (dbevent->verbose)
             multilog (dbevent->log, LOG_INFO, "ignoring event[%d], start_byte == end_byte == 0\n", i);
+          events_skipped++;
           continue;
         }
 
@@ -898,13 +900,34 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
         // now write some relevant data to the header
         ascii_header_set (header, "OBS_OFFSET", "%"PRIu64, events[i].start_byte);
         ascii_header_set (header, "FILE_SIZE", "%ld", to_read);
-        ascii_header_set (header, "EVENT_SNR", "%f", events[i].snr);
-        ascii_header_set (header, "EVENT_DM", "%f",  events[i].dm);
-        ascii_header_set (header, "EVENT_WIDTH", "%f",  events[i].width);
-        ascii_header_set (header, "EVENT_BEAM", "%u",  events[i].beam);
-        ascii_header_set (header, "EVENT_ARRIVAL", "%"PRIu64, events[i].event_arrival); // cast to know type
-        ascii_header_set (header, "EVENT_ARRIVAL_NUMER", "%"PRIu64,  events[i].event_arrival_frac_numer);
-        ascii_header_set (header, "EVENT_ARRIVAL_DENOM", "%"PRIu64,  events[i].event_arrival_frac_denom);
+
+        // write events [i - events_skipped : i] to the header
+        ascii_header_set (header, "N_EVENTS", "%u", events_skipped + 1);
+
+        int ih;
+        char keybuffer[256];
+        for (ih = i - events_skipped; ih <= i; ih++) {
+          snprintf(keybuffer, 255, "EVENT%04u_SNR", ih);
+          ascii_header_set (header, keybuffer, "%f", events[i].snr);
+
+          snprintf(keybuffer, 255, "EVENT%04u_DM", ih);
+          ascii_header_set (header, keybuffer, "%f",  events[i].dm);
+
+          snprintf(keybuffer, 255, "EVENT%04u_WIDTH", ih);
+          ascii_header_set (header, keybuffer, "%f",  events[i].width);
+
+          snprintf(keybuffer, 255, "EVENT%04u_BEAM", ih);
+          ascii_header_set (header, keybuffer, "%u",  events[i].beam);
+
+          snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL", ih);
+          ascii_header_set (header, keybuffer, "%"PRIu64, events[i].event_arrival); // cast to know type
+
+          snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL_NUMER", ih);
+          ascii_header_set (header, keybuffer, "%"PRIu64,  events[i].event_arrival_frac_numer);
+
+          snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL_DENOM", ih);
+          ascii_header_set (header, keybuffer, "%"PRIu64,  events[i].event_arrival_frac_denom);
+        }
 
         // tag this header as filled
         ipcbuf_mark_filled (dbevent->out_hdu->header_block, header_size);
@@ -918,6 +941,9 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
           multilog (log, LOG_ERR, "could not close output HDU as writer\n");
           return -1; 
         }
+
+        // we've dealt with all skipped events, so reset the counter
+        events_skipped = 0;
 
         // lock write again to re-open for the next event
         if (dada_hdu_lock_write (dbevent->out_hdu) < 0)
