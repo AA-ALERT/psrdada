@@ -191,7 +191,7 @@ int main (int argc, char** argv)
     return -1;
   }
 
-  if ((num_readers < 1) || (num_readers > 5))
+  if (num_readers < 1)
   {
     fprintf (stderr, "Number of readers was not sensible: %d\n", num_readers);
     return -1;
