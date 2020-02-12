@@ -797,164 +797,162 @@ int receive_events (dada_dbevent_t * dbevent, int listen_fd)
     {
       multilog (dbevent->log, LOG_WARNING, "Event UTC_START [%d] != Obs UTC_START [%d]\n", event_utc_start, dbevent->utc_start);
     }
-    else
+    // sort the events based on event start time
+    qsort (events, n_events, sizeof (event_t), sort_events);
+
+    // now check for overlapping events
+    for (i=1; i<n_events; i++)
     {
-      // sort the events based on event start time
-      qsort (events, n_events, sizeof (event_t), sort_events);
-
-      // now check for overlapping events
-      for (i=1; i<n_events; i++)
+      // start overlap
+      if (events[i].start_byte < events[i-1].end_byte)
       {
-        // start overlap
-        if (events[i].start_byte < events[i-1].end_byte)
-        {
-          if (dbevent->verbose)
-            multilog (dbevent->log, LOG_INFO, "amalgamating event idx %d into %d\n", i-1, i);
-          events[i].start_byte = events[i-1].start_byte;
-          events[i-1].start_byte = 0;
+        if (dbevent->verbose)
+          multilog (dbevent->log, LOG_INFO, "amalgamating event idx %d into %d\n", i-1, i);
+        events[i].start_byte = events[i-1].start_byte;
+        events[i-1].start_byte = 0;
 
-          if (events[i-1].end_byte > events[i].end_byte)
-            events[i].end_byte = events[i-1].end_byte;
-          events[i-1].end_byte = 0;
-        }
+        if (events[i-1].end_byte > events[i].end_byte)
+          events[i].end_byte = events[i-1].end_byte;
+        events[i-1].end_byte = 0;
       }
-
-      // for each event, check that its in the future, and if so, seek forward to it
-      uint64_t current_byte = 0;
-      int64_t seeked_byte = 0;
-      int events_skipped = 0;
-      for (i=0; i<n_events; i++)
-      {
-        if ((events[i].start_byte == 0) && (events[i].end_byte == 0))
-        {
-          if (dbevent->verbose)
-            multilog (dbevent->log, LOG_INFO, "ignoring event[%d], start_byte == end_byte == 0\n", i);
-          events_skipped++;
-          continue;
-        }
-
-        current_byte = ipcio_tell (dbevent->in_hdu->data_block);
-        //multilog (dbevent->log, LOG_INFO, "current_byte=%"PRIu64"\n", current_byte);
-
-        if (events[i].start_byte < current_byte)
-        {
-          multilog (dbevent->log, LOG_WARNING, "skipping events[%d], current_byte [%"PRIu64"] past event start_byte [%"PRIu64"]\n", i, current_byte, events[i].start_byte);
-          events_missed++;
-          continue;
-        }
-
-        // seek forward to the relevant point in the datablock
-        if (dbevent->verbose)
-          multilog (dbevent->log, LOG_INFO, "seeking forward %"PRIu64" bytes from start of obs\n", events[i].start_byte);
-        seeked_byte = ipcio_seek (dbevent->in_hdu->data_block, (int64_t) events[i].start_byte, SEEK_SET);
-        if (seeked_byte < 0)
-        {
-          multilog (dbevent->log, LOG_WARNING, "could not seek to byte %"PRIu64"\n", events[i].start_byte);
-          events_missed++;
-          continue;
-        }
-
-        if (dbevent->verbose)
-          multilog (dbevent->log, LOG_INFO, "seeked_byte=%"PRIi64"\n", seeked_byte);
-
-        // determine how much to read
-        size_t to_read = events[i].end_byte - events[i].start_byte;
-        multilog (dbevent->log, LOG_INFO, "to read = %d [%"PRIu64" - %"PRIu64"]\n", to_read, events[i].end_byte, events[i].start_byte);
-
-        if (dbevent->work_buffer_size < to_read)
-        {
-          dbevent->work_buffer_size = to_read;
-          if (dbevent->verbose)
-            multilog (dbevent->log, LOG_INFO, "reallocating work_buffer [%p] to %d bytes\n", 
-                      dbevent->work_buffer, dbevent->work_buffer_size);
-          dbevent->work_buffer = realloc (dbevent->work_buffer, dbevent->work_buffer_size);
-          if (dbevent->verbose)
-            multilog (dbevent->log, LOG_INFO, "reallocated work_buffer [%p]\n", dbevent->work_buffer);
-        }
-         
-        // read the event from the input buffer 
-        if (dbevent->verbose)
-          multilog (dbevent->log, LOG_INFO, "reading %d bytes from input HDU into work buffer\n", to_read);
-        ssize_t bytes_read = ipcio_read (dbevent->in_hdu->data_block, dbevent->work_buffer, to_read);
-        if (dbevent->verbose)
-          multilog (dbevent->log, LOG_INFO, "read %d bytes from input HDU into work buffer\n", bytes_read);
-        if (bytes_read < 0)
-        {
-          multilog (dbevent->log, LOG_WARNING, "receive_events: ipcio_read on input HDU failed\n");
-          return -1;
-        }
-
-        events_recorded++;
-
-        char * header = ipcbuf_get_next_write (dbevent->out_hdu->header_block);
-        uint64_t header_size = ipcbuf_get_bufsz (dbevent->out_hdu->header_block);
-        if (header_size < dbevent->header_size)
-        {
-          multilog (log, LOG_ERR, "receive_events: output header too small for input header\n");
-          return -1;
-        }
-
-        // copy the input header to the output
-        memcpy (header, dbevent->header, dbevent->header_size);
-
-        // now write some relevant data to the header
-        ascii_header_set (header, "OBS_OFFSET", "%"PRIu64, events[i].start_byte);
-        ascii_header_set (header, "FILE_SIZE", "%ld", to_read);
-
-        // write events [i - events_skipped : i] to the header
-        ascii_header_set (header, "N_EVENTS", "%u", events_skipped + 1);
-
-        int ih;
-        char keybuffer[256];
-        for (ih = i - events_skipped; ih <= i; ih++) {
-          snprintf(keybuffer, 255, "EVENT%04u_SNR", ih);
-          ascii_header_set (header, keybuffer, "%f", events[i].snr);
-
-          snprintf(keybuffer, 255, "EVENT%04u_DM", ih);
-          ascii_header_set (header, keybuffer, "%f",  events[i].dm);
-
-          snprintf(keybuffer, 255, "EVENT%04u_WIDTH", ih);
-          ascii_header_set (header, keybuffer, "%f",  events[i].width);
-
-          snprintf(keybuffer, 255, "EVENT%04u_BEAM", ih);
-          ascii_header_set (header, keybuffer, "%u",  events[i].beam);
-
-          snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL", ih);
-          ascii_header_set (header, keybuffer, "%"PRIu64, events[i].event_arrival); // cast to know type
-
-          snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL_NUMER", ih);
-          ascii_header_set (header, keybuffer, "%"PRIu64,  events[i].event_arrival_frac_numer);
-
-          snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL_DENOM", ih);
-          ascii_header_set (header, keybuffer, "%"PRIu64,  events[i].event_arrival_frac_denom);
-        }
-
-        // tag this header as filled
-        ipcbuf_mark_filled (dbevent->out_hdu->header_block, header_size);
-
-        // write the specified amount to the output data block
-        ipcio_write (dbevent->out_hdu->data_block, dbevent->work_buffer, to_read);
-
-        // close the data block to ensure EOD is written
-        if (dada_hdu_unlock_write (dbevent->out_hdu) < 0)
-        {
-          multilog (log, LOG_ERR, "could not close output HDU as writer\n");
-          return -1; 
-        }
-
-        // we've dealt with all skipped events, so reset the counter
-        events_skipped = 0;
-
-        // lock write again to re-open for the next event
-        if (dada_hdu_lock_write (dbevent->out_hdu) < 0)
-        {
-          multilog (log, LOG_ERR, "could not open output HDU as writer\n");
-          return -1;
-        }
-      }
-
-      multilog (dbevent->log, LOG_INFO, "recorded=%d missed=%d\n", events_recorded, events_missed);
     }
+
+    // for each event, check that its in the future, and if so, seek forward to it
+    uint64_t current_byte = 0;
+    int64_t seeked_byte = 0;
+    int events_skipped = 0;
+    for (i=0; i<n_events; i++)
+    {
+      if ((events[i].start_byte == 0) && (events[i].end_byte == 0))
+      {
+        if (dbevent->verbose)
+          multilog (dbevent->log, LOG_INFO, "ignoring event[%d], start_byte == end_byte == 0\n", i);
+        events_skipped++;
+        continue;
+      }
+
+      current_byte = ipcio_tell (dbevent->in_hdu->data_block);
+      //multilog (dbevent->log, LOG_INFO, "current_byte=%"PRIu64"\n", current_byte);
+
+      if (events[i].start_byte < current_byte)
+      {
+        multilog (dbevent->log, LOG_WARNING, "skipping events[%d], current_byte [%"PRIu64"] past event start_byte [%"PRIu64"]\n", i, current_byte, events[i].start_byte);
+        events_missed++;
+        continue;
+      }
+
+      // seek forward to the relevant point in the datablock
+      if (dbevent->verbose)
+        multilog (dbevent->log, LOG_INFO, "seeking forward %"PRIu64" bytes from start of obs\n", events[i].start_byte);
+      seeked_byte = ipcio_seek (dbevent->in_hdu->data_block, (int64_t) events[i].start_byte, SEEK_SET);
+      if (seeked_byte < 0)
+      {
+        multilog (dbevent->log, LOG_WARNING, "could not seek to byte %"PRIu64"\n", events[i].start_byte);
+        events_missed++;
+        continue;
+      }
+
+      if (dbevent->verbose)
+        multilog (dbevent->log, LOG_INFO, "seeked_byte=%"PRIi64"\n", seeked_byte);
+
+      // determine how much to read
+      size_t to_read = events[i].end_byte - events[i].start_byte;
+      multilog (dbevent->log, LOG_INFO, "to read = %d [%"PRIu64" - %"PRIu64"]\n", to_read, events[i].end_byte, events[i].start_byte);
+
+      if (dbevent->work_buffer_size < to_read)
+      {
+        dbevent->work_buffer_size = to_read;
+        if (dbevent->verbose)
+          multilog (dbevent->log, LOG_INFO, "reallocating work_buffer [%p] to %d bytes\n", 
+                    dbevent->work_buffer, dbevent->work_buffer_size);
+        dbevent->work_buffer = realloc (dbevent->work_buffer, dbevent->work_buffer_size);
+        if (dbevent->verbose)
+          multilog (dbevent->log, LOG_INFO, "reallocated work_buffer [%p]\n", dbevent->work_buffer);
+      }
+       
+      // read the event from the input buffer 
+      if (dbevent->verbose)
+        multilog (dbevent->log, LOG_INFO, "reading %d bytes from input HDU into work buffer\n", to_read);
+      ssize_t bytes_read = ipcio_read (dbevent->in_hdu->data_block, dbevent->work_buffer, to_read);
+      if (dbevent->verbose)
+        multilog (dbevent->log, LOG_INFO, "read %d bytes from input HDU into work buffer\n", bytes_read);
+      if (bytes_read < 0)
+      {
+        multilog (dbevent->log, LOG_WARNING, "receive_events: ipcio_read on input HDU failed\n");
+        return -1;
+      }
+
+      events_recorded++;
+
+      char * header = ipcbuf_get_next_write (dbevent->out_hdu->header_block);
+      uint64_t header_size = ipcbuf_get_bufsz (dbevent->out_hdu->header_block);
+      if (header_size < dbevent->header_size)
+      {
+        multilog (log, LOG_ERR, "receive_events: output header too small for input header\n");
+        return -1;
+      }
+
+      // copy the input header to the output
+      memcpy (header, dbevent->header, dbevent->header_size);
+
+      // now write some relevant data to the header
+      ascii_header_set (header, "OBS_OFFSET", "%"PRIu64, events[i].start_byte);
+      ascii_header_set (header, "FILE_SIZE", "%ld", to_read);
+
+      // write events [i - events_skipped : i] to the header
+      ascii_header_set (header, "N_EVENTS", "%u", events_skipped + 1);
+
+      int ih;
+      char keybuffer[256];
+      for (ih = i - events_skipped; ih <= i; ih++) {
+        snprintf(keybuffer, 255, "EVENT%04u_SNR", ih);
+        ascii_header_set (header, keybuffer, "%f", events[i].snr);
+
+        snprintf(keybuffer, 255, "EVENT%04u_DM", ih);
+        ascii_header_set (header, keybuffer, "%f",  events[i].dm);
+
+        snprintf(keybuffer, 255, "EVENT%04u_WIDTH", ih);
+        ascii_header_set (header, keybuffer, "%f",  events[i].width);
+
+        snprintf(keybuffer, 255, "EVENT%04u_BEAM", ih);
+        ascii_header_set (header, keybuffer, "%u",  events[i].beam);
+
+        snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL", ih);
+        ascii_header_set (header, keybuffer, "%"PRIu64, events[i].event_arrival); // cast to know type
+
+        snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL_NUMER", ih);
+        ascii_header_set (header, keybuffer, "%"PRIu64,  events[i].event_arrival_frac_numer);
+
+        snprintf(keybuffer, 255, "EVENT%04u_ARRIVAL_DENOM", ih);
+        ascii_header_set (header, keybuffer, "%"PRIu64,  events[i].event_arrival_frac_denom);
+      }
+
+      // tag this header as filled
+      ipcbuf_mark_filled (dbevent->out_hdu->header_block, header_size);
+
+      // write the specified amount to the output data block
+      ipcio_write (dbevent->out_hdu->data_block, dbevent->work_buffer, to_read);
+
+      // close the data block to ensure EOD is written
+      if (dada_hdu_unlock_write (dbevent->out_hdu) < 0)
+      {
+        multilog (log, LOG_ERR, "could not close output HDU as writer\n");
+        return -1; 
+      }
+
+      // we've dealt with all skipped events, so reset the counter
+      events_skipped = 0;
+
+      // lock write again to re-open for the next event
+      if (dada_hdu_lock_write (dbevent->out_hdu) < 0)
+      {
+        multilog (log, LOG_ERR, "could not open output HDU as writer\n");
+        return -1;
+      }
+    }
+
+    multilog (dbevent->log, LOG_INFO, "recorded=%d missed=%d\n", events_recorded, events_missed);
+    
   }
 
   fclose(sockin);
